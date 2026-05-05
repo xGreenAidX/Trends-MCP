@@ -206,8 +206,64 @@ def _format_tiktok_videos(videos: list) -> str:
 
 @mcp.tool()
 def search_instagram_reels_by_hashtag(hashtag: str, limit: int = 10) -> str:
-    """Simula o esegue la ricerca di Instagram Reels per hashtag (Richiede API esterne/Apify)."""
-    return "⚠️ L'integrazione diretta con Instagram Reels non è disponibile senza Apify. Controllare la guida compatta per implementare Apify Instagram Reel Scraper."
+    """Ricerca Instagram Reels per hashtag usando Apify (Actor: apify/instagram-scraper)."""
+    apify_token = os.getenv("apify")
+    if not apify_token:
+        return "❌ Manca la chiave API di Apify (configura la variabile d'ambiente 'apify')."
+        
+    try:
+        from apify_client import ApifyClient
+        client = ApifyClient(apify_token)
+        
+        # Pulizia dell'hashtag (rimuoviamo il # se presente)
+        clean_hashtag = hashtag.replace("#", "")
+        
+        # Prepariamo l'input per l'attore di Apify
+        # Usiamo l'URL diretto per l'hashtag per maggiore affidabilità
+        run_input = {
+            "directUrls": [f"https://www.instagram.com/explore/tags/{clean_hashtag}/"],
+            "resultsType": "details",
+            "resultsLimit": limit,
+            "searchType": "hashtag",
+            "searchLimit": 1
+        }
+        
+        # Lanciamo lo scraper ufficiale di Instagram su Apify
+        run = client.actor("apify/instagram-scraper").call(run_input=run_input)
+        
+        videos = []
+        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+            # Filtriamo solo i Reel/Video se possibile
+            if item.get("type") == "Video" or item.get("videoUrl") or item.get("isVideo"):
+                videos.append(item)
+                
+        if not videos:
+            return "⚠️ Nessun reel trovato per questo hashtag o limite raggiunto."
+            
+        summary = [f"✅ Found {len(videos)} Instagram Reels.\n"]
+        for i, video in enumerate(videos):
+            url = video.get("url", "No link")
+            # Tronchiamo la caption a 100 caratteri per evitare output giganti
+            desc = video.get("caption", "No desc").replace("\n", " ")[:100]
+            views = video.get("videoViewCount", 0) or 0
+            likes = video.get("likesCount", 0) or 0
+            comments = video.get("commentsCount", 0) or 0
+            
+            # Calcolo basico dell'engagement
+            eng = ((likes + comments) / views) * 100 if views > 0 else 0.0
+            
+            summary.append(f"--- Reel {i} ---\n"
+                           f"Link: {url}\n"
+                           f"Caption: {desc}...\n"
+                           f"📊 Views: {views:,} | Likes: {likes:,} | Comments: {comments:,} | Engagement: {eng:.2f}%\n"
+                           f"{'=' * 40}")
+                           
+        return "\n".join(summary)
+        
+    except ImportError:
+        return "❌ Errore: La libreria 'apify-client' non è installata. Esegui 'pip install apify-client'."
+    except Exception as e:
+        return f"❌ Errore durante l'esecuzione di Apify: {str(e)}"
 
 @mcp.tool()
 def search_yt_shorts_by_keyword(query: str, limit: int = 5) -> List[Dict[str, str]]:

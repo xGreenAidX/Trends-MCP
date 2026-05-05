@@ -16,6 +16,7 @@ Make sure the following Python packages are installed:
 - `yt_dlp`
 - `requests`
 - `fastmcp`
+- `apify-client`
 
 ---
 
@@ -129,7 +130,8 @@ TikTok RapidAPI: https://rapidapi.com/ponds4552/api/tiktok-best-experience
         "src/server.py"
       ],
       "env":{
-        "tiktok": "<tiktok token goes here>"
+        "tiktok": "<tiktok token goes here>",
+        "apify": "<apify token goes here>"
     }
     }
   }
