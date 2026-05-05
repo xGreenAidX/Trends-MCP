@@ -2,3 +2,4 @@ youtube-comment-downloader
 beautifulsoup4
 fastmcp
 yt_dlp
+requests

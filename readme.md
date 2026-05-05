@@ -57,12 +57,42 @@ Scrapes weekly Instagram Reels trends from Later.com.
 
 ---
 
+### 🔹 `search_tiktok_by_keyword()`
+
+Searches TikTok videos by keyword using the RapidAPI and returns statistics.
+
+---
+
+### 🔹 `search_tiktok_by_hashtag()`
+
+Searches TikTok videos by hashtag using the RapidAPI and returns statistics.
+
+---
+
+### 🔹 `search_instagram_reels_by_hashtag()`
+
+Placeholder tool for Instagram Reels search. Currently prompts the user to use Apify as no native open API is implemented.
+
+---
+
+### 🔹 `search_yt_shorts_by_keyword()`
+
+Searches YouTube Shorts by keyword using `yt_dlp` and returns metadata.
+
+---
+
+### 🔹 `rank_videos_by_engagement()`
+
+Ranks a given list of videos based on their engagement rate `(likes + comments + shares + saves) / views`.
+
+---
+
 ## 📁 File Structure
 
 This module can be executed via CLI or server mode using `FastMCP`:
 
 ```bash
-fastmcp run server.py
+fastmcp run src/server.py
 ```
 
 
@@ -96,7 +126,7 @@ TikTok RapidAPI: https://rapidapi.com/ponds4552/api/tiktok-best-experience
         "requests",
         "mcp",
         "run",
-        "server.py"
+        "src/server.py"
       ],
       "env":{
         "tiktok": "<tiktok token goes here>"
@@ -110,7 +140,7 @@ TikTok RapidAPI: https://rapidapi.com/ponds4552/api/tiktok-best-experience
 To run the server locally:
 
 ```bash
-fastmcp run server.py
+fastmcp run src/server.py
 ```
 ## 📎 Notes
 YouTube comment extraction uses unofficial scraping and may break with YouTube changes.
@@ -121,4 +151,5 @@ Instagram scraping is done by parsing Later.com's blog – may vary if structure
 
 ## 🧑‍💻 Author
 Trends-MCP by [Rugved Patil](https://github.com/rugvedp).
+
 
