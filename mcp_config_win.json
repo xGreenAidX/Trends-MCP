@@ -15,13 +15,20 @@
         "--with",
         "beautifulsoup4",
         "--with",
+        "scrapetube",
+        "--with",
+        "apify-client",
+        "--with",
+        "instaloader",
+        "--with",
         "requests",
         "mcp",
         "run",
         "path/to/server.py"
       ],
       "env":{
-        "tiktok": "<tiktok token goes here>"
+        "tiktok": "<tiktok token goes here>",
+        "APIFY_TOKEN": "<apify token goes here>"
     }
     }
   }

@@ -4,3 +4,4 @@ fastmcp
 yt_dlp
 requests
 apify-client
+instaloader

@@ -14,9 +14,11 @@ Make sure the following Python packages are installed:
 - `beautifulsoup4`
 - `youtube-comment-downloader`
 - `yt_dlp`
+- `scrapetube`
 - `requests`
 - `fastmcp`
 - `apify-client`
+- `instaloader`
 
 ---
 
@@ -30,13 +32,13 @@ Fetches YouTube comments for a given video ID.
 
 ### 🔹 `get_yt_trending_global()`
 
-Fetches globally trending YouTube videos (default region: US).
+Fetches trending YouTube videos (default region: US) using free Invidious public instances. If those instances are unavailable, it falls back to YouTube search scraping.
 
 ---
 
 ### 🔹 `get_yt_trending_by_region()`
 
-Fetches region-specific YouTube trending videos.
+Fetches region-specific YouTube trending videos using an ISO-2 region code such as `IT` or `US`. You can override public Invidious instances with `INVIDIOUS_INSTANCES`, comma-separated.
 
 ---
 
@@ -72,13 +74,14 @@ Searches TikTok videos by hashtag using the RapidAPI and returns statistics.
 
 ### 🔹 `search_instagram_reels_by_hashtag()`
 
-Placeholder tool for Instagram Reels search. Currently prompts the user to use Apify as no native open API is implemented.
+Searches Instagram Reels by hashtag through Apify's Instagram API Scraper when `APIFY_TOKEN` is configured. If Apify is unavailable or returns no usable reels, it falls back to `instaloader`.
+For the free fallback, optional `INSTAGRAM_USERNAME` and `INSTAGRAM_PASSWORD` environment variables can improve reliability, but they are not required.
 
 ---
 
 ### 🔹 `search_yt_shorts_by_keyword()`
 
-Searches YouTube Shorts by keyword using `yt_dlp` and returns metadata.
+Searches YouTube Shorts by keyword using YouTube search scraping and returns metadata.
 
 ---
 
@@ -98,7 +101,7 @@ fastmcp run src/server.py
 
 
 ## 🌐 External Resources
-YouTube Trending Feed: https://www.youtube.com/feed/trending
+YouTube Trending Source: Invidious `/api/v1/trending` public instances, with scraping fallback.
 
 Instagram Reels Trends Source: https://later.com/blog/instagram-reels-trends/
 
@@ -124,6 +127,12 @@ TikTok RapidAPI: https://rapidapi.com/ponds4552/api/tiktok-best-experience
         "--with",
         "beautifulsoup4",
         "--with",
+        "scrapetube",
+        "--with",
+        "apify-client",
+        "--with",
+        "instaloader",
+        "--with",
         "requests",
         "mcp",
         "run",
@@ -131,7 +140,7 @@ TikTok RapidAPI: https://rapidapi.com/ponds4552/api/tiktok-best-experience
       ],
       "env":{
         "tiktok": "<tiktok token goes here>",
-        "apify": "<apify token goes here>"
+        "APIFY_TOKEN": "<apify token goes here>"
     }
     }
   }

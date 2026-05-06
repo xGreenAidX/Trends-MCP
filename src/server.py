@@ -3,13 +3,14 @@ import json
 import datetime
 import re
 import requests
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 import yt_dlp
 from youtube_comment_downloader import YoutubeCommentDownloader
+import scrapetube
 
-mcp = FastMCP(name="Whats Trending On Social Media", dependencies=["beautifulsoup4", "youtube-comment-downloader", "yt_dlp", "requests"])
+mcp = FastMCP(name="Whats Trending On Social Media", dependencies=["beautifulsoup4", "youtube-comment-downloader", "yt_dlp", "scrapetube", "requests", "apify-client", "instaloader"])
 
 tiktok_env = os.getenv("tiktok")
 if tiktok_env:
@@ -18,14 +19,129 @@ if tiktok_env:
 # Global headers for TikTok
 TIKTOK_HEADERS = {
     "x-rapidapi-key": os.getenv("tiktok", ""),
-    "x-rapidapi-host": "tiktok-best-experience.p.rapidapi.com"
+    "x-rapidapi-host": "tiktok-scraper7.p.rapidapi.com"
 }
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+DEFAULT_INVIDIOUS_INSTANCES = [
+    "https://inv.thepixora.com",
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://yt.chocolatemoo53.com",
+]
+
+def _clamp_limit(limit: int, default: int = 10, maximum: int = 50) -> int:
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        value = default
+    return max(1, min(value, maximum))
+
+def _yt_trending_queries(region: str) -> List[str]:
+    region = (region or "US").strip().upper()[:2]
+    query_map = {
+        "IT": [
+            "tendenze youtube italia oggi",
+            "video virali italia oggi",
+            "musica tendenza italia oggi",
+            "shorts virali italia oggi",
+        ],
+        "US": [
+            "trending youtube videos today",
+            "viral videos today",
+            "trending music videos today",
+            "viral shorts today",
+        ],
+    }
+    return query_map.get(region, [
+        f"trending youtube videos {region} today",
+        f"viral videos {region} today",
+        f"trending shorts {region} today",
+    ])
+
+def _invidious_instances() -> List[str]:
+    raw = os.getenv("INVIDIOUS_INSTANCES", "")
+    instances = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+    return instances or DEFAULT_INVIDIOUS_INSTANCES
+
+def _format_invidious_trending_item(item: Dict[str, Any], region: str, source: str) -> Dict[str, str]:
+    video_id = item.get("videoId", "")
+    return {
+        "title": item.get("title", "Nessun Titolo"),
+        "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
+        "channel": item.get("author", ""),
+        "views": str(item.get("viewCount", "N/D")),
+        "published": item.get("publishedText", ""),
+        "duration": str(item.get("lengthSeconds", "")),
+        "thumbnail": (item.get("videoThumbnails") or [{}])[-1].get("url", ""),
+        "source": source,
+        "region": region,
+    }
+
+def _yt_trending_from_invidious(region: str, limit: int) -> tuple[List[Dict[str, str]], List[str]]:
+    errors = []
+    for instance in _invidious_instances():
+        url = f"{instance}/api/v1/trending"
+        try:
+            response = requests.get(
+                url,
+                headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+                params={"region": region, "type": "default"},
+                timeout=12,
+            )
+            if response.status_code != 200:
+                errors.append(f"{instance}: HTTP {response.status_code}")
+                continue
+            data = response.json()
+            if not isinstance(data, list):
+                errors.append(f"{instance}: risposta non lista")
+                continue
+            videos = [
+                _format_invidious_trending_item(item, region, f"invidious:{instance}")
+                for item in data
+                if item.get("videoId")
+            ]
+            if videos:
+                return videos[:limit], errors
+            errors.append(f"{instance}: nessun video")
+        except Exception as e:
+            errors.append(f"{instance}: {str(e)}")
+    return [], errors
+
+def _yt_trending(region: str = "US", limit: int = 10) -> List[Dict[str, str]]:
+    region = (region or "US").strip().upper()[:2]
+    limit = _clamp_limit(limit)
+    invidious_results, invidious_errors = _yt_trending_from_invidious(region, limit)
+    if invidious_results:
+        return invidious_results
+
+    results = []
+    seen_urls = set()
+    errors = invidious_errors
+
+    for query in _yt_trending_queries(region):
+        batch = search_yt_videos(query, sort_by="upload_date", limit=limit)
+        if batch and "error" in batch[0]:
+            errors.append(batch[0]["error"])
+            continue
+        for video in batch:
+            url = video.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            video["source"] = f"scrapetube_search:{query}"
+            video["region"] = region
+            results.append(video)
+            seen_urls.add(url)
+            if len(results) >= limit:
+                return results
+
+    if results:
+        return results
+    detail = f" Dettaglio: {'; '.join(errors)}" if errors else ""
+    return [{"error": f"Nessun video YouTube trending trovato tramite scraping.{detail}"}]
 
 @mcp.tool()
 def get_comments_yt(video_id: str, max_comments: int = 100) -> List[str]:
-    """Fetch YouTube comments by video ID.  
-    Returns up to `max_comments` comment texts."""
+    """Estrae i commenti di YouTube tramite video ID senza usare API key."""
     try:
         d = YoutubeCommentDownloader()
         comments = []
@@ -35,36 +151,47 @@ def get_comments_yt(video_id: str, max_comments: int = 100) -> List[str]:
                 break
         return comments
     except Exception as e:
-        return [f"Error fetching comments: {str(e)}"]
+        return [f"Errore durante l'estrazione dei commenti: {str(e)}"]
 
-def _yt_trending(region: Optional[str] = None, limit: int = 10) -> List[Dict[str, str]]:
-    url = "https://www.youtube.com/feed/trending"
-    if region: 
-        url += f"?gl={region.upper()}"
-    opts = {'extract_flat': True, 'force_generic_extractor': True, 'quiet': True, 'no_warnings': True}
+@mcp.tool()
+def search_yt_videos(query: str, sort_by: str = "view_count", limit: int = 10) -> List[Dict[str, str]]:
+    """Cerca video YouTube per keyword usando scraping.
+    sort_by può essere: 'relevance', 'upload_date', 'view_count', 'rating'."""
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return [{"title": v.get("title", "No Title"), "url": f"https://www.youtube.com/watch?v={v.get('id')}"} for v in info.get("entries", [])[:limit] if v.get("id")]
+        videos = scrapetube.get_search(query, sort_by=sort_by, limit=_clamp_limit(limit))
+        results = []
+        for v in videos:
+            title = v.get("title", {}).get("runs", [{}])[0].get("text", "Nessun Titolo")
+            video_id = v.get("videoId", "")
+            if not video_id:
+                continue
+            views = v.get("viewCountText", {}).get("simpleText", "0 visualizzazioni")
+            published = v.get("publishedTimeText", {}).get("simpleText", "")
+            results.append({
+                "title": title,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "views": views,
+                "published": published
+            })
+        return results
     except Exception as e:
-        return [{"error": str(e)}]
+        return [{"error": f"Errore: {str(e)}"}]
 
 @mcp.tool()
 def get_yt_trending_global(limit: int = 10) -> List[Dict[str, str]]:
-    """Get trending YouTube videos globally (US).  
-    Returns list of titles and URLs."""
-    return _yt_trending(limit=limit)
+    """Ottiene video YouTube in tendenza tramite endpoint gratuiti Invidious.
+    Se le istanze pubbliche non rispondono, usa una ricerca scraping best effort."""
+    return _yt_trending(region="US", limit=limit)
 
 @mcp.tool()
 def get_yt_trending_by_region(region_code: str = "IT", limit: int = 10) -> List[Dict[str, str]]:
-    """Get trending YouTube videos by region code.  
-    Returns list of titles and URLs."""
+    """Ottiene video YouTube in tendenza per paese ISO-2, ad esempio IT o US."""
     return _yt_trending(region=region_code, limit=limit)
 
 @mcp.tool()
 def get_yt_video_info(url: str) -> Optional[Dict[str, str]]:
-    """Get metadata of a YouTube video from its URL.  
-    Includes title, views, likes, description, etc."""
+    """Ottiene i metadati di un video YouTube dal suo URL tramite yt-dlp.  
+    Include titolo, visualizzazioni, mi piace, descrizione, ecc."""
     opts = {'quiet': True, 'skip_download': True, 'no_warnings': True}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -74,9 +201,9 @@ def get_yt_video_info(url: str) -> Optional[Dict[str, str]]:
                 "channel": i.get("uploader", ""),
                 "description": i.get("description", ""),
                 "views": f"{i.get('view_count', 0):,}",
-                "likes": f"{i.get('like_count', 0):,}" if i.get('like_count') else "N/A",
+                "likes": f"{i.get('like_count', 0):,}" if i.get('like_count') else "N/D",
                 "upload_date": i.get("upload_date", ""),
-                "duration": f"{i.get('duration', 0)} seconds",
+                "duration": f"{i.get('duration', 0)} secondi",
                 "thumbnail": i.get("thumbnail", ""),
                 "url": i.get("webpage_url", url),
             }
@@ -85,32 +212,32 @@ def get_yt_video_info(url: str) -> Optional[Dict[str, str]]:
 
 @mcp.tool()
 def tiktok_trending_global() -> str:
-    """Fetches and summarizes trending TikTok videos with stats and hashtags."""
+    """Recupera e riassume i video in tendenza su TikTok con statistiche e hashtag."""
     if not TIKTOK_HEADERS["x-rapidapi-key"]:
-        return "❌ Manca la chiave API di TikTok."
+        return "Manca la chiave API di TikTok."
         
     try:
-        res = requests.get("https://tiktok-best-experience.p.rapidapi.com/trending", headers=TIKTOK_HEADERS)
+        res = requests.get("https://tiktok-scraper7.p.rapidapi.com/feed/list", headers=TIKTOK_HEADERS, params={"region": "US", "count": 10})
         if res.status_code != 200:
-            return f"❌ HTTP Error: {res.status_code}"
+            return f"Errore HTTP: {res.status_code}"
             
         data = res.json()
-        if data.get("status") != "ok" or "data" not in data:
-            return "❌ Invalid or failed response from TikTok API."
+        if data.get("code") != 0:
+            return "Risposta non valida o fallita dall'API di TikTok."
 
-        videos = data["data"].get("list", [])
+        videos = data.get("data", [])
         if not videos:
-            return "⚠️ No trending videos found."
+            return "Nessun video in tendenza trovato."
 
         return _format_tiktok_videos(videos)
 
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        return f"Errore: {str(e)}"
 
 @mcp.tool()
 def get_this_weeks_reels_trends() -> List[Dict[str, str]]:
-    """Scrape this week’s Instagram Reels trends.  
-    Returns list with trend name, date, and stats."""
+    """Estrae i trend di Instagram Reels di questa settimana.  
+    Restituisce una lista con nome del trend, data e statistiche."""
     try:
         r = requests.get("https://later.com/blog/instagram-reels-trends/", headers={"User-Agent": USER_AGENT})
         if r.status_code != 200: 
@@ -140,141 +267,207 @@ def get_this_weeks_reels_trends() -> List[Dict[str, str]]:
                     continue
         return trends
     except Exception as e:
-        return [{"error": str(e)}]
+        return [{"error": f"Errore: {str(e)}"}]
 
 @mcp.tool()
 def search_tiktok_by_keyword(query: str, limit: int = 10) -> str:
     """Cerca video TikTok per keyword (es. 'viaggi over 50'). Restituisce le statistiche dei video."""
     if not TIKTOK_HEADERS["x-rapidapi-key"]:
-        return "❌ Manca la chiave API di TikTok."
+        return "Manca la chiave API di TikTok."
         
     try:
-        res = requests.get("https://tiktok-best-experience.p.rapidapi.com/search/video", headers=TIKTOK_HEADERS, params={"keywords": query, "count": limit})
+        res = requests.get("https://tiktok-scraper7.p.rapidapi.com/feed/search", headers=TIKTOK_HEADERS, params={"keywords": query, "count": limit})
         if res.status_code != 200:
-            return f"❌ Errore API o endpoint non supportato (Status: {res.status_code}). Per query specifiche si consiglia l'integrazione Apify come da guida."
+            return f"Errore API o endpoint non supportato (Status: {res.status_code}). Per query specifiche si consiglia l'integrazione Apify come da guida."
         data = res.json()
-        videos = data.get("data", {}).get("list", [])
+        videos = data.get("data", {}).get("videos", [])
         if not videos:
-            return "⚠️ Nessun video trovato."
+            return "Nessun video trovato."
         
         return _format_tiktok_videos(videos)
     except Exception as e:
-        return f"❌ Errore: {str(e)}"
+        return f"Errore: {str(e)}"
 
 @mcp.tool()
 def search_tiktok_by_hashtag(hashtag: str, limit: int = 10) -> str:
     """Cerca video TikTok per hashtag (es. 'turismoitalia')."""
-    if not TIKTOK_HEADERS["x-rapidapi-key"]:
-        return "❌ Manca la chiave API di TikTok."
-        
-    hashtag = hashtag.replace("#", "")
-    try:
-        res = requests.get("https://tiktok-best-experience.p.rapidapi.com/challenge/search", headers=TIKTOK_HEADERS, params={"keywords": hashtag, "count": limit})
-        if res.status_code != 200:
-            return f"❌ Errore API o endpoint non supportato (Status: {res.status_code}). Per hashtag si consiglia Apify."
-        data = res.json()
-        videos = data.get("data", {}).get("list", [])
-        if not videos:
-            return "⚠️ Nessun video trovato."
-        
-        return _format_tiktok_videos(videos)
-    except Exception as e:
-        return f"❌ Errore: {str(e)}"
+    hashtag = hashtag if hashtag.startswith("#") else f"#{hashtag}"
+    return search_tiktok_by_keyword(hashtag, limit)
 
 def _format_tiktok_videos(videos: list) -> str:
-    summary = [f"✅ Found {len(videos)} TikTok videos.\n"]
+    summary = [f"Trovati {len(videos)} video TikTok.\n"]
     for i, video in enumerate(videos):
-        author_name = video.get("author", {}).get("nickname") if isinstance(video.get("author"), dict) else "N/A"
-        desc = video.get("desc", "No desc")
-        link = video.get("share_url", "No link")
+        author_name = video.get("author", {}).get("nickname", "N/D")
+        author_id = video.get("author", {}).get("unique_id", "")
+        desc = video.get("title", "Nessuna descrizione")
+        video_id = video.get("video_id", "")
         
-        stats = video.get("statistics", {})
-        plays = stats.get("play_count", 0)
-        likes = stats.get("digg_count", 0)
-        comments = stats.get("comment_count", 0)
-        shares = stats.get("share_count", 0)
-        saves = stats.get("collect_count", 0)
+        link = f"https://www.tiktok.com/@{author_id}/video/{video_id}" if video_id and author_id else "Nessun link"
+        
+        plays = video.get("play_count", 0)
+        likes = video.get("digg_count", 0)
+        comments = video.get("comment_count", 0)
+        shares = video.get("share_count", 0)
+        saves = video.get("collect_count", 0) or video.get("download_count", 0)
         engagement = ((likes + comments + shares + saves) / plays) * 100 if plays > 0 else 0.0
 
         summary.append(f"--- Video {i} ---\n"
-                       f"Author: {author_name}\n"
-                       f"Desc: {desc}\n"
+                       f"Autore: {author_name}\n"
+                       f"Descrizione: {desc}\n"
                        f"Link: {link}\n"
-                       f"📊 Views: {plays:,} | Likes: {likes:,} | Comments: {comments:,} | Engagement: {engagement:.2f}%\n"
+                       f"Visualizzazioni: {plays:,} | Mi piace: {likes:,} | Commenti: {comments:,} | Engagement: {engagement:.2f}%\n"
                        f"{'=' * 40}")
     return "\n".join(summary)
 
-@mcp.tool()
-def search_instagram_reels_by_hashtag(hashtag: str, limit: int = 10) -> str:
-    """Ricerca Instagram Reels per hashtag usando Apify (Actor: apify/instagram-scraper)."""
-    apify_token = os.getenv("apify")
+def _first_value(item: Dict[str, Any], keys: List[str], default: Any = "") -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return value
+    return default
+
+def _is_instagram_video(item: Dict[str, Any]) -> bool:
+    content_type = str(_first_value(item, ["type", "productType", "mediaType"], "")).lower()
+    url = str(item.get("url", "")).lower()
+    return (
+        "video" in content_type
+        or "reel" in content_type
+        or "/reel/" in url
+        or bool(_first_value(item, ["videoUrl", "videoPlayCount", "videoViewCount", "videoDuration", "isVideo"], None))
+    )
+
+def _format_instagram_reels(items: List[Dict[str, Any]], hashtag: str, source: str = "instagram") -> str:
+    summary = [f"Trovati {len(items)} Reel/video di Instagram per #{hashtag} ({source}).\n"]
+    for i, video in enumerate(items, start=1):
+        url = _first_value(video, ["url", "inputUrl"], "Nessun link")
+        desc = str(_first_value(video, ["caption", "text", "alt", "description"], "Nessuna descrizione")).replace("\n", " ")[:180]
+        author = _first_value(video, ["ownerUsername", "username", "ownerFullName"], "N/D")
+        views = int(_first_value(video, ["videoViewCount", "videoPlayCount", "playCount", "playsCount"], 0) or 0)
+        likes = int(_first_value(video, ["likesCount", "likeCount", "likes"], 0) or 0)
+        comments = int(_first_value(video, ["commentsCount", "commentCount", "comments"], 0) or 0)
+        timestamp = _first_value(video, ["timestamp", "takenAt", "createdAt"], "")
+        audio = _first_value(video, ["musicInfo", "audioTitle", "songName"], "")
+        eng = ((likes + comments) / views) * 100 if views > 0 else 0.0
+
+        summary.append(f"--- Reel {i} ---\n"
+                       f"Autore: {author}\n"
+                       f"Link: {url}\n"
+                       f"Didascalia: {desc}{'...' if len(desc) == 180 else ''}\n"
+                       f"Audio: {audio if audio else 'N/D'}\n"
+                       f"Data: {timestamp if timestamp else 'N/D'}\n"
+                       f"Visualizzazioni: {views:,} | Mi piace: {likes:,} | Commenti: {comments:,} | Engagement: {eng:.2f}%\n"
+                       f"{'=' * 40}")
+    return "\n".join(summary)
+
+def _search_instagram_reels_with_apify(clean_hashtag: str, limit: int) -> str:
+    apify_token = os.getenv("APIFY_TOKEN") or os.getenv("apify")
     if not apify_token:
-        return "❌ Manca la chiave API di Apify (configura la variabile d'ambiente 'apify')."
-        
+        return ""
+
     try:
         from apify_client import ApifyClient
         client = ApifyClient(apify_token)
-        
-        # Pulizia dell'hashtag (rimuoviamo il # se presente)
-        clean_hashtag = hashtag.replace("#", "")
-        
-        # Prepariamo l'input per l'attore di Apify
-        # Usiamo l'URL diretto per l'hashtag per maggiore affidabilità
+
+        # L'actor ufficiale più recente supporta resultsType="reels".
+        actor_id = os.getenv("APIFY_INSTAGRAM_ACTOR", "apify/instagram-api-scraper")
         run_input = {
             "directUrls": [f"https://www.instagram.com/explore/tags/{clean_hashtag}/"],
-            "resultsType": "details",
+            "resultsType": "reels",
             "resultsLimit": limit,
             "searchType": "hashtag",
             "searchLimit": 1
         }
         
-        # Lanciamo lo scraper ufficiale di Instagram su Apify
-        run = client.actor("apify/instagram-scraper").call(run_input=run_input)
+        run = client.actor(actor_id).call(run_input=run_input)
         
-        videos = []
+        items = []
         for item in client.dataset(run["defaultDatasetId"]).iterate_items():
-            # Filtriamo solo i Reel/Video se possibile
-            if item.get("type") == "Video" or item.get("videoUrl") or item.get("isVideo"):
-                videos.append(item)
+            items.append(item)
+        videos = [item for item in items if _is_instagram_video(item)]
                 
-        if not videos:
-            return "⚠️ Nessun reel trovato per questo hashtag o limite raggiunto."
+        if videos:
+            return _format_instagram_reels(videos[:limit], clean_hashtag, source="Apify")
             
-        summary = [f"✅ Found {len(videos)} Instagram Reels.\n"]
-        for i, video in enumerate(videos):
-            url = video.get("url", "No link")
-            # Tronchiamo la caption a 100 caratteri per evitare output giganti
-            desc = video.get("caption", "No desc").replace("\n", " ")[:100]
-            views = video.get("videoViewCount", 0) or 0
-            likes = video.get("likesCount", 0) or 0
-            comments = video.get("commentsCount", 0) or 0
-            
-            # Calcolo basico dell'engagement
-            eng = ((likes + comments) / views) * 100 if views > 0 else 0.0
-            
-            summary.append(f"--- Reel {i} ---\n"
-                           f"Link: {url}\n"
-                           f"Caption: {desc}...\n"
-                           f"📊 Views: {views:,} | Likes: {likes:,} | Comments: {comments:,} | Engagement: {eng:.2f}%\n"
-                           f"{'=' * 40}")
-                           
-        return "\n".join(summary)
+        if items:
+            found_types = sorted({str(_first_value(item, ["type", "productType", "mediaType"], "sconosciuto")) for item in items})
+            return f"Apify ha restituito {len(items)} contenuti per #{clean_hashtag}, ma nessun Reel/video riconoscibile. Tipi trovati: {', '.join(found_types)}."
+        return f"Nessun reel trovato per #{clean_hashtag}. Prova un hashtag più ampio o verifica i log della run Apify {run.get('id', '')}."
         
     except ImportError:
-        return "❌ Errore: La libreria 'apify-client' non è installata. Esegui 'pip install apify-client'."
+        return "Errore: La libreria 'apify-client' non è installata. Esegui 'pip install apify-client'."
     except Exception as e:
-        return f"❌ Errore durante l'esecuzione di Apify: {str(e)}"
+        return f"Errore durante l'esecuzione di Apify: {str(e)}"
+
+def _search_instagram_reels_with_instaloader(clean_hashtag: str, limit: int) -> str:
+    try:
+        import instaloader
+    except ImportError:
+        return "Fallback Instaloader non disponibile: installa 'instaloader'."
+
+    try:
+        loader = instaloader.Instaloader(
+            download_pictures=False,
+            download_videos=False,
+            download_video_thumbnails=False,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            quiet=True,
+        )
+
+        username = os.getenv("INSTAGRAM_USERNAME")
+        password = os.getenv("INSTAGRAM_PASSWORD")
+        if username and password:
+            loader.login(username, password)
+
+        hashtag = instaloader.Hashtag.from_name(loader.context, clean_hashtag)
+        reels = []
+        for post in hashtag.get_posts():
+            if not post.is_video:
+                continue
+            shortcode = post.shortcode
+            reels.append({
+                "url": f"https://www.instagram.com/reel/{shortcode}/" if shortcode else post.url,
+                "caption": post.caption or "",
+                "ownerUsername": post.owner_username,
+                "videoViewCount": post.video_view_count or 0,
+                "likesCount": post.likes or 0,
+                "commentsCount": post.comments or 0,
+                "timestamp": post.date_utc.isoformat() if post.date_utc else "",
+                "type": post.typename,
+            })
+            if len(reels) >= limit:
+                break
+
+        if reels:
+            return _format_instagram_reels(reels, clean_hashtag, source="Instaloader fallback")
+        return f"Nessun video/Reel trovato per #{clean_hashtag} con Instaloader."
+    except Exception as e:
+        return f"Errore fallback Instaloader: {str(e)}"
 
 @mcp.tool()
-def search_yt_shorts_by_keyword(query: str, limit: int = 5) -> List[Dict[str, str]]:
-    """Cerca YouTube Shorts per keyword usando yt-dlp."""
-    opts = {'extract_flat': True, 'force_generic_extractor': True, 'quiet': True, 'no_warnings': True}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{limit}:{query} #shorts", download=False)
-            return [{"title": v.get("title", "No Title"), "url": f"https://www.youtube.com/watch?v={v.get('id')}", "views": v.get("view_count", 0)} for v in info.get("entries", []) if v.get("id")]
-    except Exception as e:
-        return [{"error": str(e)}]
+def search_instagram_reels_by_hashtag(hashtag: str, limit: int = 10) -> str:
+    """Ricerca Instagram Reels per hashtag.
+    Usa Apify se APIFY_TOKEN è configurato; altrimenti prova il fallback gratuito Instaloader."""
+    clean_hashtag = hashtag.replace("#", "").strip()
+    limit = _clamp_limit(limit, maximum=100)
+    if not clean_hashtag:
+        return "Inserisci un hashtag valido."
+
+    apify_result = _search_instagram_reels_with_apify(clean_hashtag, limit)
+    if apify_result.startswith("Trovati "):
+        return apify_result
+
+    fallback_result = _search_instagram_reels_with_instaloader(clean_hashtag, limit)
+    if apify_result:
+        return f"{fallback_result}\n\nNota Apify: {apify_result}"
+    return fallback_result
+
+@mcp.tool()
+def search_yt_shorts_by_keyword(query: str, limit: int = 10) -> List[Dict[str, str]]:
+    """Cerca YouTube Shorts per keyword usando scraping."""
+    return search_yt_videos(query=f"{query} #shorts", sort_by="relevance", limit=limit)
 
 @mcp.tool()
 def rank_videos_by_engagement(videos: List[Dict[str, float]]) -> List[Dict[str, float]]:
