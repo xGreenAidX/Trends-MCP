@@ -3,7 +3,9 @@ import json
 import datetime
 import re
 import requests
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, List, Dict, Optional
+from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 import yt_dlp
@@ -28,6 +30,8 @@ DEFAULT_INVIDIOUS_INSTANCES = [
     "https://invidious.nerdvpn.de",
     "https://yt.chocolatemoo53.com",
 ]
+HTTP_TIMEOUT = 10
+TOOL_TIMEOUT = 15
 
 def _clamp_limit(limit: int, default: int = 10, maximum: int = 50) -> int:
     try:
@@ -35,6 +39,31 @@ def _clamp_limit(limit: int, default: int = 10, maximum: int = 50) -> int:
     except (TypeError, ValueError):
         value = default
     return max(1, min(value, maximum))
+
+def _run_with_timeout(func, timeout: int, timeout_value):
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(func)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError:
+        executor.shutdown(wait=False, cancel_futures=True)
+        return timeout_value
+    finally:
+        if future.done():
+            executor.shutdown(wait=False, cancel_futures=True)
+
+def _youtube_video_id(value: str) -> str:
+    value = (value or "").strip()
+    if re.fullmatch(r"[\w-]{11}", value):
+        return value
+    parsed = urlparse(value)
+    if parsed.hostname in {"youtu.be", "www.youtu.be"}:
+        return parsed.path.strip("/").split("/")[0]
+    query_id = parse_qs(parsed.query).get("v", [""])[0]
+    if query_id:
+        return query_id
+    match = re.search(r"/(?:shorts|embed|live)/([\w-]{11})", parsed.path)
+    return match.group(1) if match else value
 
 def _yt_trending_queries(region: str) -> List[str]:
     region = (region or "US").strip().upper()[:2]
@@ -65,6 +94,10 @@ def _invidious_instances() -> List[str]:
 
 def _format_invidious_trending_item(item: Dict[str, Any], region: str, source: str) -> Dict[str, str]:
     video_id = item.get("videoId", "")
+    thumb = (item.get("videoThumbnails") or [{}])[-1].get("url", "")
+    instance = source.replace("invidious:", "", 1)
+    if thumb.startswith("/"):
+        thumb = f"{instance}{thumb}"
     return {
         "title": item.get("title", "Nessun Titolo"),
         "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
@@ -72,10 +105,89 @@ def _format_invidious_trending_item(item: Dict[str, Any], region: str, source: s
         "views": str(item.get("viewCount", "N/D")),
         "published": item.get("publishedText", ""),
         "duration": str(item.get("lengthSeconds", "")),
-        "thumbnail": (item.get("videoThumbnails") or [{}])[-1].get("url", ""),
+        "thumbnail": thumb,
         "source": source,
         "region": region,
     }
+
+def _format_invidious_video_item(item: Dict[str, Any], source: str) -> Dict[str, str]:
+    video_id = item.get("videoId", "")
+    thumb = (item.get("videoThumbnails") or [{}])[-1].get("url", "")
+    instance = source.replace("invidious:", "", 1)
+    if thumb.startswith("/"):
+        thumb = f"{instance}{thumb}"
+    return {
+        "title": item.get("title", "Nessun Titolo"),
+        "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
+        "channel": item.get("author", ""),
+        "views": str(item.get("viewCount", item.get("viewCountText", "N/D"))),
+        "published": item.get("publishedText", ""),
+        "duration": str(item.get("lengthSeconds", "")),
+        "thumbnail": thumb,
+        "source": source,
+    }
+
+def _invidious_get(path: str, params: Dict[str, Any]) -> tuple[Any, str, List[str]]:
+    errors = []
+    for instance in _invidious_instances():
+        try:
+            response = requests.get(
+                f"{instance}{path}",
+                headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+                params=params,
+                timeout=HTTP_TIMEOUT,
+            )
+            if response.status_code != 200:
+                errors.append(f"{instance}: HTTP {response.status_code}")
+                continue
+            return response.json(), instance, errors
+        except Exception as e:
+            errors.append(f"{instance}: {str(e)}")
+    return None, "", errors
+
+def _yt_search_from_invidious(query: str, sort_by: str, limit: int) -> tuple[List[Dict[str, str]], List[str]]:
+    data, instance, errors = _invidious_get(
+        "/api/v1/search",
+        {"q": query, "type": "video", "sort_by": sort_by},
+    )
+    if not isinstance(data, list):
+        return [], errors
+    videos = [
+        _format_invidious_video_item(item, f"invidious:{instance}")
+        for item in data
+        if item.get("type") == "video" and item.get("videoId")
+    ]
+    return videos[:limit], errors
+
+def _yt_video_info_from_invidious(video_id: str) -> Optional[Dict[str, str]]:
+    data, instance, _ = _invidious_get(f"/api/v1/videos/{video_id}", {})
+    if not isinstance(data, dict) or data.get("error"):
+        return None
+    return {
+        "title": data.get("title", ""),
+        "channel": data.get("author", ""),
+        "description": data.get("description", ""),
+        "views": f"{data.get('viewCount', 0):,}",
+        "likes": f"{data.get('likeCount', 0):,}" if data.get("likeCount") is not None else "N/D",
+        "upload_date": data.get("publishedText", ""),
+        "duration": f"{data.get('lengthSeconds', 0)} secondi",
+        "thumbnail": (data.get("videoThumbnails") or [{}])[-1].get("url", ""),
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "source": f"invidious:{instance}",
+    }
+
+def _yt_comments_from_invidious(video_id: str, max_comments: int) -> List[str]:
+    data, _, _ = _invidious_get(f"/api/v1/comments/{video_id}", {"sort_by": "top"})
+    if not isinstance(data, dict):
+        return []
+    comments = []
+    for item in data.get("comments", []):
+        text = item.get("content") or item.get("contentHtml") or ""
+        if text:
+            comments.append(BeautifulSoup(text, "html.parser").get_text(" ", strip=True))
+        if len(comments) >= max_comments:
+            break
+    return comments
 
 def _yt_trending_from_invidious(region: str, limit: int) -> tuple[List[Dict[str, str]], List[str]]:
     errors = []
@@ -142,14 +254,27 @@ def _yt_trending(region: str = "US", limit: int = 10) -> List[Dict[str, str]]:
 @mcp.tool()
 def get_comments_yt(video_id: str, max_comments: int = 100) -> List[str]:
     """Estrae i commenti di YouTube tramite video ID senza usare API key."""
-    try:
-        d = YoutubeCommentDownloader()
-        comments = []
-        for c in d.get_comments_from_url(f"https://www.youtube.com/watch?v={video_id}"):
-            comments.append(c["text"])
-            if len(comments) >= max_comments:
-                break
+    video_id = _youtube_video_id(video_id)
+    max_comments = _clamp_limit(max_comments, default=100, maximum=200)
+    comments = _yt_comments_from_invidious(video_id, max_comments)
+    if comments:
         return comments
+
+    def _download_comments():
+        d = YoutubeCommentDownloader()
+        downloaded = []
+        for c in d.get_comments_from_url(f"https://www.youtube.com/watch?v={video_id}"):
+            downloaded.append(c["text"])
+            if len(downloaded) >= max_comments:
+                break
+        return downloaded
+
+    try:
+        return _run_with_timeout(
+            _download_comments,
+            TOOL_TIMEOUT,
+            [f"Timeout durante l'estrazione dei commenti YouTube per {video_id}."],
+        )
     except Exception as e:
         return [f"Errore durante l'estrazione dei commenti: {str(e)}"]
 
@@ -157,8 +282,13 @@ def get_comments_yt(video_id: str, max_comments: int = 100) -> List[str]:
 def search_yt_videos(query: str, sort_by: str = "view_count", limit: int = 10) -> List[Dict[str, str]]:
     """Cerca video YouTube per keyword usando scraping.
     sort_by può essere: 'relevance', 'upload_date', 'view_count', 'rating'."""
-    try:
-        videos = scrapetube.get_search(query, sort_by=sort_by, limit=_clamp_limit(limit))
+    limit = _clamp_limit(limit)
+    invidious_results, invidious_errors = _yt_search_from_invidious(query, sort_by, limit)
+    if invidious_results:
+        return invidious_results
+
+    def _search_with_scrapetube():
+        videos = scrapetube.get_search(query, sort_by=sort_by, limit=limit)
         results = []
         for v in videos:
             title = v.get("title", {}).get("runs", [{}])[0].get("text", "Nessun Titolo")
@@ -171,9 +301,17 @@ def search_yt_videos(query: str, sort_by: str = "view_count", limit: int = 10) -
                 "title": title,
                 "url": f"https://www.youtube.com/watch?v={video_id}",
                 "views": views,
-                "published": published
+                "published": published,
+                "source": "scrapetube",
             })
         return results
+
+    try:
+        results = _run_with_timeout(_search_with_scrapetube, TOOL_TIMEOUT, [])
+        if results:
+            return results
+        detail = f" Dettaglio Invidious: {'; '.join(invidious_errors)}" if invidious_errors else ""
+        return [{"error": f"Nessun video trovato o timeout nella ricerca YouTube.{detail}"}]
     except Exception as e:
         return [{"error": f"Errore: {str(e)}"}]
 
@@ -192,10 +330,23 @@ def get_yt_trending_by_region(region_code: str = "IT", limit: int = 10) -> List[
 def get_yt_video_info(url: str) -> Optional[Dict[str, str]]:
     """Ottiene i metadati di un video YouTube dal suo URL tramite yt-dlp.  
     Include titolo, visualizzazioni, mi piace, descrizione, ecc."""
-    opts = {'quiet': True, 'skip_download': True, 'no_warnings': True}
-    try:
+    video_id = _youtube_video_id(url)
+    info = _yt_video_info_from_invidious(video_id)
+    if info:
+        return info
+
+    opts = {
+        'quiet': True,
+        'skip_download': True,
+        'no_warnings': True,
+        'socket_timeout': HTTP_TIMEOUT,
+        'retries': 1,
+        'extractor_retries': 1,
+        'noplaylist': True,
+    }
+    def _extract_with_ytdlp():
         with yt_dlp.YoutubeDL(opts) as ydl:
-            i = ydl.extract_info(url, download=False)
+            i = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
             return {
                 "title": i.get("title", ""),
                 "channel": i.get("uploader", ""),
@@ -206,7 +357,11 @@ def get_yt_video_info(url: str) -> Optional[Dict[str, str]]:
                 "duration": f"{i.get('duration', 0)} secondi",
                 "thumbnail": i.get("thumbnail", ""),
                 "url": i.get("webpage_url", url),
+                "source": "yt_dlp",
             }
+
+    try:
+        return _run_with_timeout(_extract_with_ytdlp, TOOL_TIMEOUT, None)
     except Exception: 
         return None
 
@@ -217,7 +372,7 @@ def tiktok_trending_global() -> str:
         return "Manca la chiave API di TikTok."
         
     try:
-        res = requests.get("https://tiktok-scraper7.p.rapidapi.com/feed/list", headers=TIKTOK_HEADERS, params={"region": "US", "count": 10})
+        res = requests.get("https://tiktok-scraper7.p.rapidapi.com/feed/list", headers=TIKTOK_HEADERS, params={"region": "US", "count": 10}, timeout=HTTP_TIMEOUT)
         if res.status_code != 200:
             return f"Errore HTTP: {res.status_code}"
             
@@ -239,7 +394,7 @@ def get_this_weeks_reels_trends() -> List[Dict[str, str]]:
     """Estrae i trend di Instagram Reels di questa settimana.  
     Restituisce una lista con nome del trend, data e statistiche."""
     try:
-        r = requests.get("https://later.com/blog/instagram-reels-trends/", headers={"User-Agent": USER_AGENT})
+        r = requests.get("https://later.com/blog/instagram-reels-trends/", headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
         if r.status_code != 200: 
             return []
         soup = BeautifulSoup(r.text, "html.parser")
@@ -276,7 +431,7 @@ def search_tiktok_by_keyword(query: str, limit: int = 10) -> str:
         return "Manca la chiave API di TikTok."
         
     try:
-        res = requests.get("https://tiktok-scraper7.p.rapidapi.com/feed/search", headers=TIKTOK_HEADERS, params={"keywords": query, "count": limit})
+        res = requests.get("https://tiktok-scraper7.p.rapidapi.com/feed/search", headers=TIKTOK_HEADERS, params={"keywords": query, "count": limit}, timeout=HTTP_TIMEOUT)
         if res.status_code != 200:
             return f"Errore API o endpoint non supportato (Status: {res.status_code}). Per query specifiche si consiglia l'integrazione Apify come da guida."
         data = res.json()
